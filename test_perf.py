@@ -1,14 +1,21 @@
 from datetime import datetime
 from enum import Enum
+from itertools import product
 import logging
+from multiprocessing import Queue
 from pathlib import Path
 from statistics import mean
 
+import pandas as pd
 import torch
 import torch.distributed as dist
 
 from ring_attn import RingAttention, AttentionType
 from utils import combine_traces, get_device, run_distributed_fn
+
+
+class SweepList(list):
+    pass
 
 
 class PerfTestType(Enum):
@@ -28,6 +35,7 @@ def _test_attn_perf(
     attn_type: AttentionType,
     test_type: PerfTestType,
     log_dir: Path,
+    queue: Queue,
 ):
     torch.manual_seed(42)
     dtype = torch.bfloat16
@@ -95,6 +103,8 @@ def _test_attn_perf(
         mean_duration = mean(durations)
         logging.info(f"{mean_duration = :8.4f}")
 
+        queue.put(dict(rank=rank, mean_duration=mean_duration))
+
     else:
         raise ValueError(f"Invalid {test_type=}")
 
@@ -103,42 +113,66 @@ def _test_attn_perf(
 
 
 if __name__ == "__main__":
+    logging.getLogger().setLevel(logging.DEBUG)
+
     world_size = 4
 
-    common_kwargs = dict(
+    test_config = dict(
         batch_size=2,
-        dim=4096,
-        dim_per_head=128,
+        dim_per_head=SweepList((64, 128)),
+        dim=SweepList((1024, 2048, 4096, 8192)),
+        seq_len=SweepList((16384, 32768, 65536, 131072)),
+        attn_type=SweepList((AttentionType.STRIPED, AttentionType.STAIRCASE)),
         dtype=torch.bfloat16,
         num_warmup_iters=4,
         num_active_iters=4,
-        test_type=PerfTestType.PROFILE,
+        test_type=PerfTestType.TIMING,
     )
 
-    for seq_len, attn_type in [
-        (4_096, AttentionType.RING),
-        (8_192, AttentionType.RING),
-        (16_384, AttentionType.RING),
-        (32_768, AttentionType.RING),
-        (65_536, AttentionType.RING),
-        (4_096, AttentionType.STRIPED),
-        (8_192, AttentionType.STRIPED),
-        (16_384, AttentionType.STRIPED),
-        (32_768, AttentionType.STRIPED),
-        (65_536, AttentionType.STRIPED),
-    ]:
+    queue = Queue()
+
+    timing_results = []
+
+    common_kwargs = {k: v for k, v in test_config.items() if not isinstance(v, SweepList)}
+    all_sweep_kwargs = {k: v for k, v in test_config.items() if isinstance(v, SweepList)}
+    sweep_keys, all_sweep_vals = zip(*all_sweep_kwargs.items())
+
+    for sweep_vals in product(*all_sweep_vals):
+        sweep_kwargs = dict(zip(sweep_keys, sweep_vals))
+        attn_kwargs = dict(**common_kwargs, **sweep_kwargs)
+
+        attn_type = attn_kwargs["attn_type"]
+        seq_len = attn_kwargs["seq_len"]
+        
         causal = {
             AttentionType.RING: False,
             AttentionType.STRIPED: True,
+            AttentionType.STAIRCASE: True,
         }[attn_type]
 
-        logging.getLogger().setLevel(logging.DEBUG)
+        attn_kwargs["causal"] = causal
+
+        print(f"Starting test with the following configuration:\n{attn_kwargs}")
+
         log_dir_name = datetime.now().strftime("%Y%m%d_%H%M%S")
         log_dir_name = f"{log_dir_name}_seqlen_{seq_len}_type_{attn_type.name}_causal_{causal}"
         log_dir = Path("./log") / log_dir_name
 
-        kwargs = dict(**common_kwargs, seq_len=seq_len, attn_type=attn_type, causal=causal, log_dir=log_dir)
+        kwargs = dict(**attn_kwargs, log_dir=log_dir, queue=queue)
         run_distributed_fn(_test_attn_perf, world_size=world_size, kwargs=kwargs)
+
+        while not queue.empty():
+            timing_results.append(dict(**queue.get(), **attn_kwargs))
 
         if log_dir.exists():
             combine_traces(log_dir)
+
+    if len(timing_results):
+        log_dir = Path("./log")
+        log_dir.mkdir(exist_ok=True, parents=True)
+
+        timing_output_path = log_dir / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_timings.csv"
+
+        timing_df = pd.DataFrame(timing_results)
+        timing_df.to_csv(timing_output_path, index=False)
+        print(f"Wrote timing data to {str(timing_output_path)}")
