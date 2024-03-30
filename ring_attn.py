@@ -1,7 +1,7 @@
 from enum import Enum
 
 from einops import rearrange
-from triton_attn import flash_attn_func, ring_attn_func, striped_attn_func
+from triton_attn import flash_attn_func, ring_attn_func, striped_attn_func, staircase_attn_func
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -13,6 +13,7 @@ class AttentionType(Enum):
     FLASH = 1
     RING = 2
     STRIPED = 3
+    STAIRCASE = 4
 
 
 class RingAttention(nn.Module):
@@ -33,7 +34,7 @@ class RingAttention(nn.Module):
         assert dim % dim_per_head == 0, (dim, dim_per_head)
         assert seq_len % n_ranks == 0, (seq_len, n_ranks)
 
-        if attn_type == AttentionType.STRIPED:
+        if attn_type in (AttentionType.STRIPED, AttentionType.STAIRCASE):
             assert causal, causal
 
         self.dim = dim
@@ -61,8 +62,12 @@ class RingAttention(nn.Module):
             x_shard = torch.split(x, seq_len // self.n_ranks, dim=1)[self.rank].contiguous()
         elif self.attn_type == AttentionType.STRIPED:
             x_shard = x.view(batch_size, seq_len // self.n_ranks, self.n_ranks, dim)[:, :, self.rank]
-        elif self.attn_type in (AttentionType.SDPA, AttentionType.FLASH):
-            x_shard = x
+        elif self.attn_type == AttentionType.STAIRCASE:
+            x_batch_1, x_batch_2 = torch.split(x, batch_size // 2, dim=0)
+            x_shard = torch.cat((
+                torch.split(x_batch_1, seq_len // self.n_ranks, dim=1)[self.rank],
+                torch.split(x_batch_2, seq_len // self.n_ranks, dim=1)[self.n_ranks - self.rank - 1],
+            ), dim=0)
         else:
             raise ValueError(f"Invalid {self.attn_type=}")
 
@@ -82,6 +87,11 @@ class RingAttention(nn.Module):
             all_x = torch.cat(all_x, dim=1)
         elif self.attn_type == AttentionType.STRIPED:
             all_x = torch.stack(all_x, dim=2).view(batch_size, seq_len, dim)
+        elif self.attn_type == AttentionType.STAIRCASE:
+            all_x = torch.cat(all_x, dim=1)
+            x_batch_1, x_batch_2 = torch.split(all_x, batch_size // 2, dim=0)
+            batch_2_seq_idxs = torch.cat(torch.split(torch.arange(seq_len), seq_len // self.n_ranks, dim=0)[::-1], dim=0)
+            all_x = torch.cat((x_batch_1, x_batch_2[:, batch_2_seq_idxs]), dim=0)
         else:
             raise ValueError(f"Invalid {self.attn_type=}")
 
@@ -102,6 +112,8 @@ class RingAttention(nn.Module):
             o = ring_attn_func(q, k, v, self.n_ranks, self.rank, self.prev_rank, self.next_rank, None, self.causal, sm_scale)
         elif self.attn_type == AttentionType.STRIPED:
             o = striped_attn_func(q, k, v, self.n_ranks, self.rank, self.prev_rank, self.next_rank, None, self.causal, sm_scale)
+        elif self.attn_type == AttentionType.STAIRCASE:
+            o = staircase_attn_func(q, k, v, self.n_ranks, self.rank, self.prev_rank, self.next_rank, None, self.causal, sm_scale)
         else:
             raise ValueError(f"Invalid {self.attn_type=}")
 

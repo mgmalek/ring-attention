@@ -131,3 +131,18 @@ def test_striped_attn(batch_size, dim, dim_per_head, seq_len, causal, world_size
         causal=causal, base_attn_type=base_attn_type, cand_attn_type=cand_attn_type
     )
     run_distributed_fn(_test_attn, world_size=world_size, kwargs=kwargs)
+
+
+@common_test_params
+@pytest.mark.parametrize("seq_len", [1536])
+@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("world_size", list(range(torch.cuda.device_count())))
+def test_staircase_attn(batch_size, dim, dim_per_head, seq_len, causal, world_size):
+    logging.getLogger().setLevel(logging.DEBUG)
+    base_attn_type = AttentionType.FLASH
+    cand_attn_type = AttentionType.STAIRCASE
+    kwargs = dict(
+        batch_size=batch_size, dim=dim, dim_per_head=dim_per_head, seq_len=seq_len,
+        causal=causal, base_attn_type=base_attn_type, cand_attn_type=cand_attn_type
+    )
+    run_distributed_fn(_test_attn, world_size=world_size, kwargs=kwargs)

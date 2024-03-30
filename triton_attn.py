@@ -1512,6 +1512,264 @@ class StripedAttnFunc(torch.autograd.Function):
         return dq, dk, dv, None, None, None, None, None, None, None
 
 
+class StaircaseAttnFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, n_ranks, rank, prev_rank, next_rank, bias=None, causal=False, softmax_scale=None):
+        """
+        q: (batch_size, seqlen_q, nheads, headdim)
+        k, v: (batch_size, seqlen_k, nheads, headdim)
+        bias: optional, shape broadcastible to (batch, nheads, seqlen_q, seqlen_k).
+            For example, ALiBi mask for causal would have shape (1, nheads, 1, seqlen_k).
+            ALiBi mask for non-causal would have shape (1, nheads, seqlen_q, seqlen_k)
+        """
+        # Make sure that the last dimension is contiguous
+        q, k, v = [x if x.stride(-1) == 1 else x.contiguous() for x in [q, k, v]]
+        batch_times_two, seqlen_q, nheads, d = q.shape
+        assert batch_times_two % 2 == 0, batch_times_two
+        batch = batch_times_two // 2
+
+        q = q.view(2, batch, seqlen_q, nheads, d)
+        k = k.view(2, batch, seqlen_q, nheads, d)
+        v = v.view(2, batch, seqlen_q, nheads, d)
+
+        # NOTE: we lose a bit of precision by keeping o in half precision. To be more mathematically
+        # equivalent with a single-iter kernel we would probably keep o in fp32 and cast to bf16 at
+        # the end but it's probably OK to do it this way
+        o = torch.zeros_like(q)
+
+        seqlen_q_rounded = math.ceil(seqlen_q / 128) * 128
+        M = torch.full((2, batch, nheads, seqlen_q_rounded), fill_value=float("-Inf"), device=q.device, dtype=torch.float32)
+        lse = torch.full((2, batch, nheads, seqlen_q_rounded), fill_value=float("-Inf"), device=q.device, dtype=torch.float32)
+        tmp = torch.empty((2, batch, nheads, seqlen_q_rounded), device=q.device, dtype=torch.float32)
+
+        kv1_send_buffer = torch.stack((k[1], v[1]), dim=0)
+        send_buffer = torch.stack((k[0], v[0]), dim=0)  # start with first microbatch
+        recv_buffer = torch.empty_like(send_buffer)
+        for i in range(n_ranks + 1):
+            is_final_iter = i == n_ranks
+            is_final_two_iters = i >= n_ranks - 1
+
+            # Determine which microbatch we're using this iteration
+            microbatch_idx = 0 if (i <= rank) else 1
+            q_curr = q[microbatch_idx]
+            o_curr = o[microbatch_idx]
+            M_curr = M[microbatch_idx]
+            lse_curr = lse[microbatch_idx]
+            tmp_curr = tmp[microbatch_idx]
+
+            if not is_final_two_iters:
+                p2p_ops = []
+
+                if rank == 0:
+                    p2p_ops.append(dist.P2POp(dist.isend, send_buffer, next_rank))
+                elif rank == n_ranks - 1:
+                    p2p_ops.append(dist.P2POp(dist.irecv, recv_buffer, prev_rank))
+                else:
+                    # send and recv new (k, v) asynchronously
+                    p2p_ops.append(dist.P2POp(dist.isend, send_buffer, next_rank))
+                    p2p_ops.append(dist.P2POp(dist.irecv, recv_buffer, prev_rank))
+
+                if i < n_ranks:
+                    # we handle transferring kv data for the second microbatch to the zero'th rank separately here
+                    kv_transfer_src = n_ranks - i - 1
+
+                    if rank == 0:
+                        p2p_ops.append(dist.P2POp(dist.irecv, recv_buffer, kv_transfer_src))
+                    
+                    if rank == kv_transfer_src: 
+                        p2p_ops.append(dist.P2POp(dist.isend, kv1_send_buffer, 0))  # assume we always transfer to rank 0
+
+                reqs = []
+                if len(p2p_ops):
+                    reqs = dist.batch_isend_irecv(p2p_ops)
+            
+            if is_final_iter:
+                k_curr = k[1]
+                v_curr = v[1]
+            else:
+                kv_curr = send_buffer
+                k_curr, v_curr = torch.unbind_copy(kv_curr, dim=0)
+
+            block_causal = (i == 0) or (i == n_ranks)
+            is_final_kv_iter = (i == rank) or (i == n_ranks)
+
+            softmax_scale = _flash_attn_forward(
+                q=q_curr,
+                k=k_curr,
+                v=v_curr,
+                o=o_curr,
+                M=M_curr,
+                lse=lse_curr,
+                tmp=tmp_curr,
+                is_final_iter=is_final_kv_iter,
+                bias=bias,
+                causal=block_causal,
+                softmax_scale=softmax_scale
+            )
+
+            if not is_final_two_iters:
+                for req in reqs:
+                    req.wait()
+
+                send_buffer, recv_buffer = recv_buffer, send_buffer
+
+        ctx.save_for_backward(q, k, v, o, lse, bias)
+        ctx.causal = causal
+        ctx.n_ranks = n_ranks
+        ctx.rank = rank
+        ctx.prev_rank = prev_rank
+        ctx.next_rank = next_rank
+        ctx.softmax_scale = softmax_scale
+
+        o = o.view(batch_times_two, seqlen_q, nheads, d)
+        return o
+
+    @staticmethod
+    def backward(ctx, do):
+        # NOTE: k and v are the keys and values corresponding to ctx.next_rank
+        q, k, v, o, lse, bias = ctx.saved_tensors
+        assert not ctx.needs_input_grad[6], "FlashAttention does not support bias gradient yet"
+
+        causal = ctx.causal
+        n_ranks, rank, prev_rank, next_rank = ctx.n_ranks, ctx.rank, ctx.prev_rank, ctx.next_rank
+
+        # compute delta
+        _two, batch, seqlen_q, n_heads, d = o.shape
+        o_flat = o.view(2 * batch, seqlen_q, n_heads, d)
+        lse_flat = lse.view(2 * batch, seqlen_q, n_heads)
+        delta_flat = _flash_attn_backward_prepro(do, o_flat, lse_flat)
+        delta = delta_flat.view(2, batch, seqlen_q, n_heads)
+        do = do.view(2, batch, seqlen_q, n_heads, d)
+
+        # initialize comms buffers
+        kv_send_buffer = torch.stack((k[0], v[0]), dim=0)
+        kv_recv_buffer = torch.zeros_like(kv_send_buffer)  # TODO: this can be empty_like
+        dkv_send_buffer = torch.zeros_like(kv_send_buffer, dtype=torch.float32)
+        dkv_recv_buffer = torch.zeros_like(dkv_send_buffer)
+
+        kv1_send_buffer = torch.stack((k[1], v[1]), dim=0)
+
+        final_dkv0 = torch.zeros_like(dkv_send_buffer)  # TODO: this can be empty_like
+
+        dkv = torch.zeros_like(kv_send_buffer)  # TODO: this can be empty_like
+        dq = torch.zeros_like(q)
+
+        is_first_rank = rank == 0
+        is_last_rank = rank == n_ranks - 1
+
+        for i in range(n_ranks + 1):
+            is_first_iter = (i == 0)
+            is_final_iter = (i == n_ranks)
+
+            microbatch_idx = 0 if (i <= rank) else 1
+            do_curr = do[microbatch_idx]
+            q_curr = q[microbatch_idx]
+            o_curr = o[microbatch_idx]
+            lse_curr = lse[microbatch_idx]
+            delta_curr = delta[microbatch_idx]
+            dq_curr = dq[microbatch_idx]
+
+            if is_final_iter:
+                curr_k, curr_v = torch.unbind_copy(kv1_send_buffer, dim=0)
+            else:
+                curr_k, curr_v = torch.unbind_copy(kv_send_buffer, dim=0)
+
+            dkv.zero_()
+            dk = dkv[0]
+            dv = dkv[1]
+
+            p2p_ops = []
+            
+            # launch ops for sending kv blocks across ranks
+            if not is_final_iter:
+                if not is_last_rank:
+                    # all ranks except the last one should send their kv block to the next rank
+                    p2p_ops.append(dist.P2POp(dist.isend, kv_send_buffer, next_rank))
+                
+                if not is_first_rank:
+                    # all ranks except the first one should receive a kv block from the previous rank
+                    p2p_ops.append(dist.P2POp(dist.irecv, kv_recv_buffer, prev_rank))
+
+            # launch ops transferring kv data for the 2nd microbatch to the zero'th rank
+            if i < n_ranks - 1:
+                kv_transfer_src = n_ranks - i - 1
+
+                if is_first_rank:
+                    p2p_ops.append(dist.P2POp(dist.irecv, kv_recv_buffer, kv_transfer_src))
+
+                if rank == kv_transfer_src: 
+                    p2p_ops.append(dist.P2POp(dist.isend, kv1_send_buffer, 0))  # assume we always transfer to rank 0
+
+            # launch ops for sending dkv blocks across ranks
+            if not is_first_iter:
+                if not is_last_rank:
+                    # all ranks except the last one should send their dkv block to the next rank
+                    p2p_ops.append(dist.P2POp(dist.isend, dkv_send_buffer, next_rank))
+
+                if not is_first_rank:
+                    # all ranks except the first one should receive a dkv block from the previous rank
+                    p2p_ops.append(dist.P2POp(dist.irecv, dkv_recv_buffer, prev_rank))
+
+            # launch ops transferring dkv from the last rank to other ranks
+            if i == 1:
+                final_dkv0.copy_(dkv_send_buffer)
+            elif i >= 2:
+                # send first microbatch dkv from rank n_ranks-1 to other ranks
+                dkv_transfer_rank = n_ranks - i
+
+                if is_last_rank:
+                    p2p_ops.append(dist.P2POp(dist.isend, dkv_send_buffer, dkv_transfer_rank))
+                elif rank == dkv_transfer_rank:
+                    p2p_ops.append(dist.P2POp(dist.irecv, final_dkv0, n_ranks - 1))
+ 
+            reqs = []
+            if len(p2p_ops):
+                reqs = dist.batch_isend_irecv(p2p_ops)
+
+            block_causal = (i == 0) or (i == n_ranks)
+
+            # Triton's autotune causes the Tensor._version to change, and so Pytorch autograd
+            # does a memcpy. To avoid this we run in inference_mode, which doesn't track the version.
+            with torch.inference_mode():
+                _flash_attn_backward(
+                    do=do_curr,
+                    q=q_curr,
+                    k=curr_k,
+                    v=curr_v,
+                    o=o_curr,
+                    lse=lse_curr,
+                    delta=delta_curr,
+                    dq=dq_curr,
+                    dk=dk,
+                    dv=dv,
+                    bias=bias,
+                    causal=block_causal,
+                    softmax_scale=ctx.softmax_scale,
+                )
+
+            for req in reqs:
+                req.wait()
+
+            # accumulate recv'd dkv with computed dkv (or if this is the first iteration then set dkv_recv_buffer to dkv)
+            if (rank == 0) and (i > 0):
+                dkv_recv_buffer.zero_()
+
+            dkv_recv_buffer += dkv
+
+            kv_send_buffer, kv_recv_buffer = kv_recv_buffer, kv_send_buffer
+            dkv_send_buffer, dkv_recv_buffer = dkv_recv_buffer, dkv_send_buffer
+
+        dk0, dv0 = torch.unbind(final_dkv0, dim=0)
+        dk1, dv1 = torch.unbind(dkv_send_buffer.to(dtype=k.dtype), dim=0)
+
+        dq = dq.view(2 * batch, seqlen_q, n_heads, d)
+        dk = torch.cat((dk0, dk1), dim=0)
+        dv = torch.cat((dv0, dv1), dim=0)
+
+        return dq, dk, dv, None, None, None, None, None, None, None
+
+
 flash_attn_func = FlashAttnFunc.apply
 ring_attn_func = RingAttnFunc.apply
 striped_attn_func = StripedAttnFunc.apply
+staircase_attn_func = StaircaseAttnFunc.apply
