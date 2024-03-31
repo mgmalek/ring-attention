@@ -79,6 +79,7 @@ def _test_attn_perf(
 
     elif test_type == PerfTestType.TIMING:
         events = []
+        peak_mem_gbs = []
         for iter_num in range(num_iters):
             if rank == 0:
                 logging.info(f"Starting {iter_num=}")
@@ -86,13 +87,21 @@ def _test_attn_perf(
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)
 
+            torch.cuda.reset_peak_memory_stats()
+            initial_peak_mem_bytes = torch.cuda.max_memory_allocated(device=device)
+
             start_event.record()
             dist_out = attn(x_shard)
             dist_out.sum().backward()
             end_event.record()
 
+            final_peak_mem_bytes = torch.cuda.max_memory_allocated(device=device)
+            peak_mem_consumed_bytes = final_peak_mem_bytes - initial_peak_mem_bytes
+            peak_mem_consumed_gb = peak_mem_consumed_bytes / 1e9
+
             if iter_num >= num_warmup_iters:
                 events.append((start_event, end_event))
+                peak_mem_gbs.append(peak_mem_consumed_gb)
         
         torch.cuda.synchronize()
 
@@ -103,7 +112,10 @@ def _test_attn_perf(
         mean_duration = mean(durations)
         logging.info(f"{mean_duration = :8.4f}")
 
-        queue.put(dict(rank=rank, mean_duration=mean_duration))
+        mean_peak_mem_gb = mean(peak_mem_gbs)
+        logging.info(f"{mean_peak_mem_gb = :8.4f}")
+
+        queue.put(dict(rank=rank, mean_duration=mean_duration, mean_peak_mem_gb=mean_peak_mem_gb))
 
     else:
         raise ValueError(f"Invalid {test_type=}")
@@ -121,7 +133,7 @@ if __name__ == "__main__":
         batch_size=2,
         dim_per_head=SweepList((64, 128)),
         dim=SweepList((1024, 2048, 4096, 8192)),
-        seq_len=SweepList((16384, 32768, 65536, 131072)),
+        seq_len=SweepList((16384, 32768, 65536)),
         attn_type=SweepList((AttentionType.STRIPED, AttentionType.STAIRCASE)),
         dtype=torch.bfloat16,
         num_warmup_iters=4,
